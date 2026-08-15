@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use async_executor;
 use futures_lite::StreamExt;
 use zbus::fdo::ObjectManagerProxy;
 use zbus::names::OwnedInterfaceName;
@@ -104,6 +105,7 @@ impl DeviceInfo {
   }
 }
 
+#[derive(Clone)]
 pub struct Manager {
   conn: Connection,
   config: HashMap<String, String>,
@@ -295,7 +297,7 @@ impl Manager {
     Ok(())
   }
 
-  pub async fn run_automount(&self) -> Result<()> {
+  pub async fn run_automount(&self, ex: &async_executor::LocalExecutor<'_>) -> Result<()> {
     let manager = self.object_manager().await?;
 
     // devices already attached before we started listening won't generate an InterfacesAdded
@@ -304,7 +306,14 @@ impl Manager {
 
     for (path, ifaces) in &initial {
       let info = DeviceInfo::from_interfaces(ifaces);
-      self.handle_device_event(&path.as_ref(), &info).await;
+      let manager = self.clone();
+      let path_owned = path.clone();
+      ex.spawn(async move {
+        manager
+          .handle_device_event(&path_owned.as_ref(), &info)
+          .await;
+      })
+      .detach();
     }
 
     let mut stream = manager
@@ -316,7 +325,12 @@ impl Manager {
     while let Some(signal) = stream.next().await {
       let Ok(args) = signal.args() else { continue };
       let info = DeviceInfo::from_interfaces(args.interfaces_and_properties());
-      self.handle_device_event(args.object_path(), &info).await;
+      let manager = self.clone();
+      let path_owned = args.object_path().to_owned();
+      ex.spawn(async move {
+        manager.handle_device_event(&path_owned, &info).await;
+      })
+      .detach();
     }
 
     Ok(())
@@ -427,11 +441,13 @@ impl Manager {
     mount_options: &HashMap<&str, Value<'_>>,
   ) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(3);
+    let mut delay = Duration::from_millis(10);
     loop {
       match self.mount_filesystem(path, mount_options).await {
         Ok(mp) => return Ok(mp),
         Err(_) if Instant::now() < deadline => {
-          async_io::Timer::after(Duration::from_millis(200)).await;
+          async_io::Timer::after(delay).await;
+          delay = (delay * 2).min(Duration::from_millis(100));
         }
         Err(e) => return Err(e),
       }

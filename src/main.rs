@@ -51,15 +51,16 @@ pub enum Commands {
 
 fn main() -> anyhow::Result<()> {
   let args = Cli::parse();
+  let ex = async_executor::LocalExecutor::new();
 
-  async_io::block_on(async {
+  async_io::block_on(ex.run(async {
     let conn = Connection::system()
       .await
       .context("Failed to establish system D-Bus connection")?;
     let manager = Manager::new(conn, args.config.as_deref());
 
     match args.command {
-      Commands::Auto => manager.run_automount().await?,
+      Commands::Auto => manager.run_automount(&ex).await?,
       Commands::Mount { device, options } => {
         manager.mount_device(&device, options.as_deref()).await?;
       }
@@ -67,5 +68,5 @@ fn main() -> anyhow::Result<()> {
       Commands::Info { target, all } => manager.info(&target, all).await?,
     }
     Ok(())
-  })
+  }))
 }
