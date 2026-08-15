@@ -32,7 +32,11 @@ trait Filesystem {
   default_service = "org.freedesktop.UDisks2"
 )]
 trait Encrypted {
-  fn unlock(&self, passphrase: &str, options: HashMap<&str, Value<'_>>) -> zbus::Result<String>;
+  fn unlock(
+    &self,
+    passphrase: &str,
+    options: HashMap<&str, Value<'_>>,
+  ) -> zbus::Result<OwnedObjectPath>;
   fn lock(&self, options: HashMap<&str, Value<'_>>) -> zbus::Result<()>;
 }
 
@@ -90,7 +94,7 @@ impl Manager {
         }
       };
 
-      match self.mount_filesystem(&cleartext_path, mount_options.as_deref()) {
+      match self.try_mount_with_retry(&cleartext_path, mount_options.as_deref()) {
         Ok(mount_point) => {
           send_notify(
             "Drive Unlocked & Mounted",
@@ -151,7 +155,7 @@ impl Manager {
         .path(path.as_str())?
         .build()?;
       match enc.lock(HashMap::new()) {
-        Ok(()) => send_notify("Drive Locked", &format!("Locked container for {target}")),
+        Ok(()) => send_notify("Drive Locked", &format!("Locked container {target}")),
         Err(e) => send_notify("Lock Failed", &e.to_string()),
       }
     }
@@ -192,8 +196,7 @@ impl Manager {
     let enc = EncryptedProxyBlocking::builder(&self.conn)
       .path(path.as_str())?
       .build()?;
-    let cleartext = enc.unlock(passphrase, HashMap::new())?;
-    OwnedObjectPath::try_from(cleartext).map_err(|e| zbus::Error::Failure(e.to_string()))
+    enc.unlock(passphrase, HashMap::new())
   }
 
   fn mount_filesystem(
