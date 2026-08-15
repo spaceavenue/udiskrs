@@ -92,9 +92,15 @@ impl DeviceInfo {
 
     info
   }
+  fn is_mounted(&self) -> bool {
+    self
+      .filesystem
+      .as_ref()
+      .is_some_and(|fs| !fs.mount_points.is_empty())
+  }
 
   fn should_automount(&self) -> bool {
-    self.is_block && !self.hints.ignore && self.hints.auto
+    self.is_block && !self.hints.ignore && self.hints.auto && !self.is_mounted()
   }
 }
 
