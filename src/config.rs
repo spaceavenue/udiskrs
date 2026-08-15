@@ -2,20 +2,19 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
-/// Resolves config path. Order of precendence is CLI -> `XDG_CONFIG_HOME` -> /etc
+/// Resolves config path. Order of precedence is CLI -> `XDG_CONFIG_HOME` -> `$HOME/.config` -> `/etc`
 fn resolve_path(path: Option<&Path>) -> Option<PathBuf> {
-  if let Some(p) = path
-    && p.exists()
-  {
+  if let Some(p) = path.filter(|p| p.exists()) {
     return Some(p.to_path_buf());
   }
 
-  if let Ok(mut user_config) = env::var("XDG_CONFIG_HOME") {
-    user_config.push_str("udiskrs/mounts.conf");
-    let p = PathBuf::from(user_config);
-    if p.exists() {
-      return Some(p);
-    }
+  let user_config = env::var_os("XDG_CONFIG_HOME")
+    .map(PathBuf::from)
+    .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    .map(|p| p.join("udiskrs/mounts.conf"));
+
+  if let Some(p) = user_config.filter(|p| p.exists()) {
+    return Some(p);
   }
 
   let system_config = PathBuf::from("/etc/udiskrs/mounts.conf");
