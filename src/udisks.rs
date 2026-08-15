@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use notify_rust::Notification;
 use zbus::blocking::Connection;
+use zbus::blocking::fdo::ObjectManagerProxy;
 use zbus::fdo::ManagedObjects;
 use zbus::names::OwnedInterfaceName;
 use zbus::proxy;
@@ -16,22 +17,6 @@ use crate::config;
 const IFACE_FILESYSTEM: &str = "org.freedesktop.UDisks2.Filesystem";
 const IFACE_ENCRYPTED: &str = "org.freedesktop.UDisks2.Encrypted";
 const IFACE_BLOCK: &str = "org.freedesktop.UDisks2.Block";
-
-#[proxy(
-  interface = "org.freedesktop.DBus.ObjectManager",
-  default_service = "org.freedesktop.UDisks2",
-  default_path = "/org/freedesktop/UDisks2"
-)]
-trait ObjectManager {
-  fn get_managed_objects(&self) -> zbus::Result<ManagedObjects>;
-
-  #[zbus(signal)]
-  fn interfaces_added(
-    &self,
-    object_path: ObjectPath<'_>,
-    interfaces_and_properties: HashMap<&str, HashMap<&str, Value<'_>>>,
-  ) -> zbus::Result<()>;
-}
 
 #[proxy(
   interface = "org.freedesktop.UDisks2.Filesystem",
@@ -67,7 +52,7 @@ impl Manager {
     device: &str,
     mount_options: Option<&str>,
   ) -> Result<(), Box<dyn std::error::Error>> {
-    let manager = ObjectManagerProxyBlocking::builder(&self.conn).build()?;
+    let manager = ObjectManagerProxy::builder(&self.conn).build()?;
     let objects = manager.get_managed_objects()?;
 
     let Some(path) = find_block_object(&objects, device) else {
@@ -109,7 +94,7 @@ impl Manager {
         Ok(mount_point) => {
           send_notify(
             "Drive Unlocked & Mounted",
-            &format!("Mounted at {mount_point}"),
+            &format!("Mounted {device} at {mount_point}"),
           );
         }
         Err(e) => {
@@ -128,7 +113,7 @@ impl Manager {
   }
 
   pub fn unmount_target(&self, target: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let manager = ObjectManagerProxyBlocking::builder(&self.conn).build()?;
+    let manager = ObjectManagerProxy::builder(&self.conn).build()?;
     let objects = manager.get_managed_objects()?;
     let target_is_dir = Path::new(target).is_dir();
 
@@ -175,7 +160,7 @@ impl Manager {
   }
 
   pub fn run_automount(&self) -> Result<(), Box<dyn std::error::Error>> {
-    let manager = ObjectManagerProxyBlocking::builder(&self.conn).build()?;
+    let manager = ObjectManagerProxy::builder(&self.conn).build()?;
 
     // devices already attached before we started listening won't generate an InterfacesAdded
     // signal, so sweep once at startup too
