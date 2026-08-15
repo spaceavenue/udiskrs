@@ -1,0 +1,145 @@
+use std::collections::HashMap;
+use std::path::Path;
+
+use notify_rust::Notification;
+use zbus::fdo::ManagedObjects;
+use zbus::names::OwnedInterfaceName;
+use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
+
+use crate::udisks::DeviceInfo;
+
+pub fn send_notify(title: &str, body: &str) {
+  let _ = Notification::new()
+    .summary(title)
+    .body(body)
+    .appname("udiskrs")
+    .show();
+  println!("[{title}] {body}");
+}
+
+pub fn find_block_device(
+  objects: &ManagedObjects,
+  device: &Path,
+) -> Option<(OwnedObjectPath, DeviceInfo)> {
+  let target_buf;
+  let target: &Path = if device.starts_with("/dev") {
+    device
+  } else {
+    target_buf = Path::new("/dev").join(device);
+    &target_buf
+  };
+
+  objects.iter().find_map(|(path, ifaces)| {
+    let info = DeviceInfo::from_interfaces(ifaces);
+    let matches =
+      info.device.as_deref() == Some(target) || info.preferred_device.as_deref() == Some(target);
+    matches.then(|| (path.clone(), info))
+  })
+}
+
+pub fn print_device_info(info: &DeviceInfo, mount_options: &HashMap<&str, Value<'_>>) {
+  let device = info
+    .device
+    .as_deref()
+    .map_or("-", |p| p.to_str().unwrap_or("-"));
+  let preferred_device = info
+    .preferred_device
+    .as_deref()
+    .map_or("-", |p| p.to_str().unwrap_or("-"));
+  let backing_dev = info
+    .crypto_backing_device
+    .as_deref()
+    .map_or("-", |p| p.as_str());
+  let uuid = info.uuid.as_deref().unwrap_or("-");
+  let is_block = info.is_block;
+  let is_encrypted = info.is_encrypted;
+  let mp_or_no_fs = match &info.filesystem {
+    Some(fs) => {
+      let mount_points = fs
+        .mount_points
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+      format!("Mount Point(s):     {mount_points}")
+    }
+    None => "Filesystem:         -".to_string(),
+  };
+  let auto = info.hints.auto;
+  let ignore = info.hints.ignore;
+  let should_automount = info.should_automount();
+  let config_opts = mount_options
+    .get("options")
+    .and_then(|v| <&str>::try_from(v).ok())
+    .unwrap_or("-");
+  let output = format!(
+    r"
+Device:             {device}
+Preferred Device:   {preferred_device}
+UUID:               {uuid}
+Is Block Device:    {is_block}
+Is Encrypted:       {is_encrypted}
+Crypto Backing Dev: {backing_dev}
+{mp_or_no_fs}
+Hint Auto:          {auto}
+Hint Ignore:        {ignore}
+Should Automount:   {should_automount}
+Config Mount Opts:  {config_opts}"
+  );
+  println!("Device Summary");
+  print!("------------------------------------------");
+  println!("{output}");
+}
+
+pub fn print_udisks_properties(
+  path: &ObjectPath<'_>,
+  ifaces: &HashMap<OwnedInterfaceName, HashMap<String, OwnedValue>>,
+) {
+  println!("\nUDisks2 D-Bus Properties ({path})");
+  println!("------------------------------------------");
+
+  let mut sorted_ifaces: Vec<_> = ifaces.iter().collect();
+  sorted_ifaces.sort_by_key(|(name, _)| name.as_str());
+
+  for (iface, props) in sorted_ifaces {
+    println!("\n[{iface}]");
+    let mut sorted_props: Vec<_> = props.iter().collect();
+    sorted_props.sort_by_key(|(k, _)| k.as_str());
+
+    for (k, v) in sorted_props {
+      let formatted = format_prop_value(v);
+      println!("  {k:<24} {formatted}");
+    }
+  }
+}
+
+fn format_prop_value(val: &OwnedValue) -> String {
+  let val_ref: &Value<'_> = val;
+
+  // Pretty-print byte arrays ('ay') as strings if valid UTF-8
+  if let Ok(bytes) = <Vec<u8>>::try_from(val_ref.clone()) {
+    let lossy = String::from_utf8_lossy(&bytes);
+    let trimmed = lossy.trim_end_matches('\0');
+    if !trimmed.is_empty()
+      && trimmed
+        .chars()
+        .all(|c| !c.is_control() || c == '\n' || c == '\t')
+    {
+      return format!("\"{trimmed}\"");
+    }
+  }
+
+  // Pretty-print arrays of byte arrays ('aay') such as MountPoints/Symlinks
+  if let Ok(entries) = <Vec<Vec<u8>>>::try_from(val_ref.clone()) {
+    let items: Vec<String> = entries
+      .into_iter()
+      .map(|b| {
+        let lossy = String::from_utf8_lossy(&b);
+        format!("\"{}\"", lossy.trim_end_matches('\0'))
+      })
+      .collect();
+    return format!("[{}]", items.join(", "));
+  }
+
+  format!("{val_ref}")
+}

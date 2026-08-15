@@ -2,11 +2,12 @@ mod config;
 mod password;
 mod property;
 mod udisks;
+mod util;
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use zbus::blocking::Connection;
+use zbus::Connection;
 
 use crate::udisks::Manager;
 
@@ -49,14 +50,19 @@ pub enum Commands {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
   let args = Cli::parse();
-  let conn = Connection::system()?;
-  let manager = Manager::new(conn, args.config.as_deref());
 
-  match args.command {
-    Commands::Auto => manager.run_automount()?,
-    Commands::Mount { device, options } => manager.mount_device(&device, options.as_deref())?,
-    Commands::Unmount { target } => manager.unmount_target(&target)?,
-    Commands::Info { target, all } => manager.info(&target, all)?,
-  }
-  Ok(())
+  async_io::block_on(async {
+    let conn = Connection::system().await?;
+    let manager = Manager::new(conn, args.config.as_deref());
+
+    match args.command {
+      Commands::Auto => manager.run_automount().await?,
+      Commands::Mount { device, options } => {
+        manager.mount_device(&device, options.as_deref()).await?;
+      }
+      Commands::Unmount { target } => manager.unmount_target(&target).await?,
+      Commands::Info { target, all } => manager.info(&target, all).await?,
+    }
+    Ok(())
+  })
 }

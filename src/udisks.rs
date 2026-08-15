@@ -2,16 +2,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use notify_rust::Notification;
-use zbus::blocking::Connection;
-use zbus::blocking::fdo::ObjectManagerProxy;
-use zbus::fdo::ManagedObjects;
-use zbus::names::OwnedInterfaceName;
-use zbus::proxy;
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
+use futures_lite::StreamExt;
+use zbus::fdo::ObjectManagerProxy;
+use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
+use zbus::{Connection, proxy};
 
 use crate::property::{InterfaceMap, PropertyMap};
-use crate::{config, password};
+use crate::{config, password, util};
 
 const UDISKS2_SERVICE: &str = "org.freedesktop.UDisks2";
 const UDISKS2_PATH: &str = "/org/freedesktop/UDisks2";
@@ -24,8 +21,8 @@ const IFACE_BLOCK: &str = "org.freedesktop.UDisks2.Block";
   default_service = "org.freedesktop.UDisks2"
 )]
 trait Filesystem {
-  fn mount(&self, options: HashMap<&str, Value<'_>>) -> zbus::Result<String>;
-  fn unmount(&self, options: HashMap<&str, Value<'_>>) -> zbus::Result<()>;
+  async fn mount(&self, options: HashMap<&str, Value<'_>>) -> zbus::Result<String>;
+  async fn unmount(&self, options: HashMap<&str, Value<'_>>) -> zbus::Result<()>;
 }
 
 #[proxy(
@@ -33,35 +30,35 @@ trait Filesystem {
   default_service = "org.freedesktop.UDisks2"
 )]
 trait Encrypted {
-  fn unlock(
+  async fn unlock(
     &self,
     passphrase: &str,
     options: HashMap<&str, Value<'_>>,
   ) -> zbus::Result<OwnedObjectPath>;
-  fn lock(&self, options: HashMap<&str, Value<'_>>) -> zbus::Result<()>;
+  async fn lock(&self, options: HashMap<&str, Value<'_>>) -> zbus::Result<()>;
 }
 
 #[derive(Debug, Default)]
-struct DeviceHints {
-  auto: bool,
-  ignore: bool,
+pub struct DeviceHints {
+  pub auto: bool,
+  pub ignore: bool,
 }
 
 #[derive(Debug)]
-struct FilesystemInfo {
-  mount_points: Vec<PathBuf>,
+pub struct FilesystemInfo {
+  pub mount_points: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default)]
-struct DeviceInfo {
-  filesystem: Option<FilesystemInfo>,
-  is_block: bool,
-  is_encrypted: bool,
-  hints: DeviceHints,
-  uuid: Option<String>,
-  device: Option<PathBuf>,
-  preferred_device: Option<PathBuf>,
-  crypto_backing_device: Option<OwnedObjectPath>,
+pub struct DeviceInfo {
+  pub filesystem: Option<FilesystemInfo>,
+  pub is_block: bool,
+  pub is_encrypted: bool,
+  pub hints: DeviceHints,
+  pub uuid: Option<String>,
+  pub device: Option<PathBuf>,
+  pub preferred_device: Option<PathBuf>,
+  pub crypto_backing_device: Option<OwnedObjectPath>,
 }
 impl DeviceInfo {
   pub fn from_interfaces(ifaces: &impl InterfaceMap) -> Self {
@@ -99,7 +96,7 @@ impl DeviceInfo {
       .is_some_and(|fs| !fs.mount_points.is_empty())
   }
 
-  fn should_automount(&self) -> bool {
+  pub fn should_automount(&self) -> bool {
     self.is_block && !self.hints.ignore && self.hints.auto && !self.is_mounted()
   }
 }
@@ -114,24 +111,25 @@ impl Manager {
     Self { conn, config }
   }
 
-  fn object_manager(&self) -> zbus::Result<ObjectManagerProxy<'_>> {
+  async fn object_manager(&self) -> zbus::Result<ObjectManagerProxy<'_>> {
     ObjectManagerProxy::builder(&self.conn)
       .destination(UDISKS2_SERVICE)?
       .path(UDISKS2_PATH)?
       .build()
+      .await
   }
 
-  pub fn mount_device(
+  pub async fn mount_device(
     &self,
     device: &Path,
     mount_options: Option<&str>,
   ) -> Result<(), Box<dyn std::error::Error>> {
     let device_display = device.display();
-    let manager = self.object_manager()?;
-    let objects = manager.get_managed_objects()?;
+    let manager = self.object_manager().await?;
+    let objects = manager.get_managed_objects().await?;
 
-    let Some((path, info)) = find_block_device(&objects, device) else {
-      send_notify("Mount Failed", &format!("No such device: {device_display}"));
+    let Some((path, info)) = util::find_block_device(&objects, device) else {
+      util::send_notify("Mount Failed", &format!("No such device: {device_display}"));
       return Ok(());
     };
 
@@ -139,15 +137,15 @@ impl Manager {
       self.decode_mount_options(info.uuid.as_deref(), info.device.as_deref(), mount_options);
 
     if info.filesystem.is_some() {
-      match self.try_mount_with_retry(&path, &mount_options) {
+      match self.try_mount_with_retry(&path, &mount_options).await {
         Ok(mount_point) => {
-          send_notify(
+          util::send_notify(
             "Drive Mounted",
             &format!("Mounted {device_display} at {mount_point}"),
           );
         }
         Err(e) => {
-          send_notify("Mount Failed", &e.to_string());
+          util::send_notify("Mount Failed", &e.to_string());
           return Err(Box::new(e));
         }
       }
@@ -155,42 +153,45 @@ impl Manager {
     }
 
     if info.is_encrypted {
-      send_notify("Encrypted Drive", &format!("Unlocking {device_display}..."));
+      util::send_notify("Encrypted Drive", &format!("Unlocking {device_display}..."));
       let passphrase = password::prompt_password("Passphrase: ")?;
 
-      let cleartext_path = match self.unlock_encrypted(&path, &passphrase) {
+      let cleartext_path = match self.unlock_encrypted(&path, &passphrase).await {
         Ok(p) => p,
         Err(e) => {
-          send_notify("Unlock Failed", &e.to_string());
+          util::send_notify("Unlock Failed", &e.to_string());
           return Err(Box::new(e));
         }
       };
 
-      match self.try_mount_with_retry(&cleartext_path, &mount_options) {
+      match self
+        .try_mount_with_retry(&cleartext_path, &mount_options)
+        .await
+      {
         Ok(mount_point) => {
-          send_notify(
+          util::send_notify(
             "Drive Unlocked & Mounted",
             &format!("Mounted {device_display} at {mount_point}"),
           );
         }
         Err(e) => {
-          send_notify("Mount Failed", &e.to_string());
+          util::send_notify("Mount Failed", &e.to_string());
           return Err(Box::new(e));
         }
       }
       return Ok(());
     }
 
-    send_notify(
+    util::send_notify(
       "Mount Failed",
       &format!("{device_display} has neither a filesystem nor an encrypted payload"),
     );
     Ok(())
   }
 
-  pub fn unmount_target(&self, target: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let manager = self.object_manager()?;
-    let objects = manager.get_managed_objects()?;
+  pub async fn unmount_target(&self, target: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = self.object_manager().await?;
+    let objects = manager.get_managed_objects().await?;
     let target_path = Path::new(target);
     let target_is_dir = target_path.is_dir();
     let target_dev = if target.starts_with("/dev/") {
@@ -214,7 +215,7 @@ impl Manager {
     });
 
     let Some((path, info)) = hit else {
-      send_notify(
+      util::send_notify(
         "Unmount Failed",
         &format!("{target} is not a known mount or device"),
       );
@@ -222,70 +223,73 @@ impl Manager {
     };
 
     if info.filesystem.is_some() {
-      let fs = FilesystemProxyBlocking::builder(&self.conn)
+      let fs = FilesystemProxy::builder(&self.conn)
         .path(path.as_str())?
-        .build()?;
+        .build()
+        .await?;
 
-      if let Err(e) = fs.unmount(HashMap::new()) {
-        send_notify("Unmount Failed", &e.to_string());
+      if let Err(e) = fs.unmount(HashMap::new()).await {
+        util::send_notify("Unmount Failed", &e.to_string());
         return Err(Box::new(e));
       }
-      send_notify("Drive Unmounted", &format!("Unmounted {target}"));
+      util::send_notify("Drive Unmounted", &format!("Unmounted {target}"));
     }
 
     // Lock LUKS container:
     // If the unmounted device is a cleartext child, its CryptoBackingDevice property points to the
     // encrypted container
     if let Some(ref backing_path) = info.crypto_backing_device {
-      let enc = EncryptedProxyBlocking::builder(&self.conn)
+      let enc = EncryptedProxy::builder(&self.conn)
         .path(backing_path.as_str())?
-        .build()?;
-      match enc.lock(HashMap::new()) {
-        Ok(()) => send_notify(
+        .build()
+        .await?;
+      match enc.lock(HashMap::new()).await {
+        Ok(()) => util::send_notify(
           "Drive Locked",
           &format!("Locked encrypted container for {target}"),
         ),
-        Err(e) => send_notify("Lock Failed", &e.to_string()),
+        Err(e) => util::send_notify("Lock Failed", &e.to_string()),
       }
     } else if info.is_encrypted {
-      let enc = EncryptedProxyBlocking::builder(&self.conn)
+      let enc = EncryptedProxy::builder(&self.conn)
         .path(path.as_str())?
-        .build()?;
-      match enc.lock(HashMap::new()) {
-        Ok(()) => send_notify("Drive Locked", &format!("Locked container {target}")),
-        Err(e) => send_notify("Lock Failed", &e.to_string()),
+        .build()
+        .await?;
+      match enc.lock(HashMap::new()).await {
+        Ok(()) => util::send_notify("Drive Locked", &format!("Locked container {target}")),
+        Err(e) => util::send_notify("Lock Failed", &e.to_string()),
       }
     }
 
     Ok(())
   }
 
-  pub fn run_automount(&self) -> Result<(), Box<dyn std::error::Error>> {
-    let manager = self.object_manager()?;
+  pub async fn run_automount(&self) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = self.object_manager().await?;
 
     // devices already attached before we started listening won't generate an InterfacesAdded
     // signal, so sweep once at startup too
-    let initial = manager.get_managed_objects()?;
+    let initial = manager.get_managed_objects().await?;
     for (path, ifaces) in &initial {
       let info = DeviceInfo::from_interfaces(ifaces);
-      self.handle_device_event(&path.as_ref(), &info);
+      self.handle_device_event(&path.as_ref(), &info).await;
     }
 
-    let stream = manager.receive_interfaces_added()?;
-    send_notify("Automount Active", "Listening for UDisks2 events...");
+    let mut stream = manager.receive_interfaces_added().await?;
+    util::send_notify("Automount Active", "Listening for UDisks2 events...");
 
-    for signal in stream {
+    while let Some(signal) = stream.next().await {
       let Ok(args) = signal.args() else { continue };
       let info = DeviceInfo::from_interfaces(args.interfaces_and_properties());
-      self.handle_device_event(args.object_path(), &info);
+      self.handle_device_event(args.object_path(), &info).await;
     }
 
     Ok(())
   }
 
-  pub fn info(&self, target: &str, all: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let manager = self.object_manager()?;
-    let objects = manager.get_managed_objects()?;
+  pub async fn info(&self, target: &str, all: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = self.object_manager().await?;
+    let objects = manager.get_managed_objects().await?;
     let target_path = Path::new(target);
     let target_is_dir = target_path.is_dir();
     let target_dev = if target.starts_with("/dev/") {
@@ -308,7 +312,7 @@ impl Manager {
     });
 
     let Some((path, ifaces)) = hit else {
-      send_notify(
+      util::send_notify(
         "Failed to get info",
         &format!("{target} is not a known mount or device"),
       );
@@ -317,21 +321,21 @@ impl Manager {
     let info = DeviceInfo::from_interfaces(ifaces);
     let mount_options =
       self.decode_mount_options(info.uuid.as_deref(), info.device.as_deref(), None);
-    print_device_info(&info, &mount_options);
+    util::print_device_info(&info, &mount_options);
     if all {
-      print_udisks_properties(&path.as_ref(), ifaces);
+      util::print_udisks_properties(&path.as_ref(), ifaces);
     }
 
     Ok(())
   }
 
-  fn handle_device_event(&self, path: &ObjectPath<'_>, dev: &DeviceInfo) {
+  async fn handle_device_event(&self, path: &ObjectPath<'_>, dev: &DeviceInfo) {
     if !dev.should_automount() {
       return;
     }
 
     if dev.is_encrypted {
-      send_notify(
+      util::send_notify(
         "Encrypted Drive Attached",
         &format!("{path} needs to be unlocked manually!"),
       );
@@ -342,36 +346,38 @@ impl Manager {
       let mount_options =
         self.decode_mount_options(dev.uuid.as_deref(), dev.device.as_deref(), None);
       let owned_path = OwnedObjectPath::from(path.to_owned());
-      match self.try_mount_with_retry(&owned_path, &mount_options) {
-        Ok(mp) => send_notify("Drive Mounted", &format!("Auto-mounted {path} at {mp}")),
-        Err(e) => send_notify("Automount Failed", &format!("{path}: {e}")),
+      match self.try_mount_with_retry(&owned_path, &mount_options).await {
+        Ok(mp) => util::send_notify("Drive Mounted", &format!("Auto-mounted {path} at {mp}")),
+        Err(e) => util::send_notify("Automount Failed", &format!("{path}: {e}")),
       }
     }
   }
 
-  fn unlock_encrypted(
+  async fn unlock_encrypted(
     &self,
     path: &OwnedObjectPath,
     passphrase: &str,
   ) -> zbus::Result<OwnedObjectPath> {
-    let enc = EncryptedProxyBlocking::builder(&self.conn)
+    let enc = EncryptedProxy::builder(&self.conn)
       .path(path.as_str())?
-      .build()?;
-    enc.unlock(passphrase, HashMap::new())
+      .build()
+      .await?;
+    enc.unlock(passphrase, HashMap::new()).await
   }
 
-  fn mount_filesystem(
+  async fn mount_filesystem(
     &self,
     path: &OwnedObjectPath,
     mount_options: &HashMap<&str, Value<'_>>,
   ) -> zbus::Result<String> {
-    let fs = FilesystemProxyBlocking::builder(&self.conn)
+    let fs = FilesystemProxy::builder(&self.conn)
       .path(path.as_str())?
-      .build()?;
-    fs.mount(mount_options.clone())
+      .build()
+      .await?;
+    fs.mount(mount_options.clone()).await
   }
 
-  fn try_mount_with_retry(
+  async fn try_mount_with_retry(
     &self,
     path: &OwnedObjectPath,
     mount_options: &HashMap<&str, Value<'_>>,
@@ -380,7 +386,7 @@ impl Manager {
     // so we retry briefly
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-      match self.mount_filesystem(path, mount_options) {
+      match self.mount_filesystem(path, mount_options).await {
         Ok(mp) => return Ok(mp),
         Err(_) if Instant::now() < deadline => {
           std::thread::sleep(Duration::from_millis(200));
@@ -415,140 +421,4 @@ impl Manager {
       .map(|s| HashMap::from([("options", Value::from(s))]))
       .unwrap_or_default()
   }
-}
-
-fn print_device_info(info: &DeviceInfo, mount_options: &HashMap<&str, Value<'_>>) {
-  let device = info
-    .device
-    .as_deref()
-    .map_or("-", |p| p.to_str().unwrap_or("-"));
-  let preferred_device = info
-    .preferred_device
-    .as_deref()
-    .map_or("-", |p| p.to_str().unwrap_or("-"));
-  let backing_dev = info
-    .crypto_backing_device
-    .as_deref()
-    .map_or("-", |p| p.as_str());
-  let uuid = info.uuid.as_deref().unwrap_or("-");
-  let is_block = info.is_block;
-  let is_encrypted = info.is_encrypted;
-  let mp_or_no_fs = match &info.filesystem {
-    Some(fs) => {
-      let mount_points = fs
-        .mount_points
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-      format!("Mount Point(s):     {mount_points}")
-    }
-    None => format!("Filesystem:         -"),
-  };
-  let auto = info.hints.auto;
-  let ignore = info.hints.ignore;
-  let should_automount = info.should_automount();
-  let config_opts = mount_options
-    .get("options")
-    .and_then(|v| <&str>::try_from(v).ok())
-    .unwrap_or("-");
-  let output = format!(
-    r"
-Device:             {device}
-Preferred Device:   {preferred_device}
-UUID:               {uuid}
-Is Block Device:    {is_block}
-Is Encrypted:       {is_encrypted}
-Crypto Backing Dev: {backing_dev}
-{mp_or_no_fs}
-Hint Auto:          {auto}
-Hint Ignore:        {ignore}
-Should Automount:   {should_automount}
-Config Mount Opts:  {config_opts}"
-  );
-  println!("Device Summary");
-  print!("------------------------------------------");
-  println!("{output}");
-}
-
-fn print_udisks_properties(
-  path: &ObjectPath<'_>,
-  ifaces: &HashMap<OwnedInterfaceName, HashMap<String, OwnedValue>>,
-) {
-  println!("\nUDisks2 D-Bus Properties ({path})");
-  println!("------------------------------------------");
-
-  let mut sorted_ifaces: Vec<_> = ifaces.iter().collect();
-  sorted_ifaces.sort_by_key(|(name, _)| name.as_str());
-
-  for (iface, props) in sorted_ifaces {
-    println!("\n[{iface}]");
-    let mut sorted_props: Vec<_> = props.iter().collect();
-    sorted_props.sort_by_key(|(k, _)| k.as_str());
-
-    for (k, v) in sorted_props {
-      let formatted = format_prop_value(v);
-      println!("  {k:<24} {formatted}");
-    }
-  }
-}
-
-fn format_prop_value(val: &OwnedValue) -> String {
-  let val_ref: &Value<'_> = val;
-
-  // Pretty-print byte arrays ('ay') as strings if valid UTF-8
-  if let Ok(bytes) = <Vec<u8>>::try_from(val_ref.clone()) {
-    let lossy = String::from_utf8_lossy(&bytes);
-    let trimmed = lossy.trim_end_matches('\0');
-    if !trimmed.is_empty()
-      && trimmed
-        .chars()
-        .all(|c| !c.is_control() || c == '\n' || c == '\t')
-    {
-      return format!("\"{trimmed}\"");
-    }
-  }
-
-  // Pretty-print arrays of byte arrays ('aay') such as MountPoints/Symlinks
-  if let Ok(entries) = <Vec<Vec<u8>>>::try_from(val_ref.clone()) {
-    let items: Vec<String> = entries
-      .into_iter()
-      .map(|b| {
-        let lossy = String::from_utf8_lossy(&b);
-        format!("\"{}\"", lossy.trim_end_matches('\0'))
-      })
-      .collect();
-    return format!("[{}]", items.join(", "));
-  }
-
-  format!("{val_ref}")
-}
-
-fn send_notify(title: &str, body: &str) {
-  let _ = Notification::new()
-    .summary(title)
-    .body(body)
-    .appname("udiskrs")
-    .show();
-  println!("[{title}] {body}");
-}
-
-fn find_block_device(
-  objects: &ManagedObjects,
-  device: &Path,
-) -> Option<(OwnedObjectPath, DeviceInfo)> {
-  let target_buf;
-  let target: &Path = if device.starts_with("/dev") {
-    device
-  } else {
-    target_buf = Path::new("/dev").join(device);
-    &target_buf
-  };
-
-  objects.iter().find_map(|(path, ifaces)| {
-    let info = DeviceInfo::from_interfaces(ifaces);
-    let matches =
-      info.device.as_deref() == Some(target) || info.preferred_device.as_deref() == Some(target);
-    matches.then(|| (path.clone(), info))
-  })
 }
