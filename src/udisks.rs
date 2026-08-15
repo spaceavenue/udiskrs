@@ -12,6 +12,8 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 use crate::property::{InterfaceMap, PropertyMap};
 use crate::{config, password};
 
+const UDISKS2_SERVICE: &str = "org.freedesktop.UDisks2";
+const UDISKS2_PATH: &str = "/org/freedesktop/UDisks2";
 const IFACE_FILESYSTEM: &str = "org.freedesktop.UDisks2.Filesystem";
 const IFACE_ENCRYPTED: &str = "org.freedesktop.UDisks2.Encrypted";
 const IFACE_BLOCK: &str = "org.freedesktop.UDisks2.Block";
@@ -105,13 +107,20 @@ impl Manager {
     Self { conn, config }
   }
 
+  fn object_manager(&self) -> zbus::Result<ObjectManagerProxy<'_>> {
+    ObjectManagerProxy::builder(&self.conn)
+      .destination(UDISKS2_SERVICE)?
+      .path(UDISKS2_PATH)?
+      .build()
+  }
+
   pub fn mount_device(
     &self,
     device: &Path,
     mount_options: Option<&str>,
   ) -> Result<(), Box<dyn std::error::Error>> {
     let device_display = device.display();
-    let manager = ObjectManagerProxy::builder(&self.conn).build()?;
+    let manager = self.object_manager()?;
     let objects = manager.get_managed_objects()?;
 
     let Some((path, info)) = find_block_device(&objects, device) else {
@@ -173,7 +182,7 @@ impl Manager {
   }
 
   pub fn unmount_target(&self, target: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let manager = ObjectManagerProxy::builder(&self.conn).build()?;
+    let manager = self.object_manager()?;
     let objects = manager.get_managed_objects()?;
     let target_path = Path::new(target);
     let target_is_dir = target_path.is_dir();
@@ -245,7 +254,7 @@ impl Manager {
   }
 
   pub fn run_automount(&self) -> Result<(), Box<dyn std::error::Error>> {
-    let manager = ObjectManagerProxy::builder(&self.conn).build()?;
+    let manager = self.object_manager()?;
 
     // devices already attached before we started listening won't generate an InterfacesAdded
     // signal, so sweep once at startup too
