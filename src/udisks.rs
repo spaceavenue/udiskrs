@@ -1,18 +1,16 @@
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use notify_rust::Notification;
 use zbus::blocking::Connection;
 use zbus::blocking::fdo::ObjectManagerProxy;
 use zbus::fdo::ManagedObjects;
-use zbus::names::OwnedInterfaceName;
 use zbus::proxy;
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Str, Value};
+use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 
-use crate::config;
+use crate::property::{InterfaceMap, PropertyMap};
+use crate::{config, password};
 
 const IFACE_FILESYSTEM: &str = "org.freedesktop.UDisks2.Filesystem";
 const IFACE_ENCRYPTED: &str = "org.freedesktop.UDisks2.Encrypted";
@@ -40,11 +38,67 @@ trait Encrypted {
   fn lock(&self, options: HashMap<&str, Value<'_>>) -> zbus::Result<()>;
 }
 
+#[derive(Debug, Default)]
+struct DeviceHints {
+  auto: bool,
+  ignore: bool,
+}
+
+#[derive(Debug)]
+struct FilesystemInfo {
+  mount_points: Vec<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+struct DeviceInfo {
+  filesystem: Option<FilesystemInfo>,
+  is_block: bool,
+  is_encrypted: bool,
+  hints: DeviceHints,
+  uuid: Option<String>,
+  device: Option<PathBuf>,
+  preferred_device: Option<PathBuf>,
+  crypto_backing_device: Option<OwnedObjectPath>,
+}
+impl DeviceInfo {
+  pub fn from_interfaces(ifaces: &impl InterfaceMap) -> Self {
+    let mut info = Self {
+      is_encrypted: ifaces.has_iface(IFACE_ENCRYPTED),
+      ..Default::default()
+    };
+
+    if let Some(props) = ifaces.get_iface(IFACE_FILESYSTEM) {
+      info.filesystem = Some(FilesystemInfo {
+        mount_points: props.get_paths("MountPoints"),
+      });
+    }
+
+    if let Some(props) = ifaces.get_iface(IFACE_BLOCK) {
+      info.is_block = true;
+      info.hints = DeviceHints {
+        auto: props.get_bool("HintAuto"),
+        ignore: props.get_bool("HintIgnore"),
+      };
+      info.uuid = props.get_str("IdUUID");
+      info.device = props.get_path("Device");
+      info.preferred_device = props.get_path("PreferredDevice");
+      info.crypto_backing_device = props
+        .get_object_path("CryptoBackingDevice")
+        .filter(|p| p.as_str() != "/");
+    }
+
+    info
+  }
+
+  fn should_automount(&self) -> bool {
+    self.is_block && !self.hints.ignore && self.hints.auto
+  }
+}
+
 pub struct Manager {
   conn: Connection,
   config: HashMap<String, String>,
 }
-
 impl Manager {
   pub fn new(conn: Connection, config_path: Option<&Path>) -> Self {
     let config = config::load_config(config_path);
@@ -53,25 +107,27 @@ impl Manager {
 
   pub fn mount_device(
     &self,
-    device: &str,
+    device: &Path,
     mount_options: Option<&str>,
   ) -> Result<(), Box<dyn std::error::Error>> {
+    let device_display = device.display();
     let manager = ObjectManagerProxy::builder(&self.conn).build()?;
     let objects = manager.get_managed_objects()?;
 
-    let Some(path) = find_block_object(&objects, device) else {
-      send_notify("Mount Failed", &format!("No such device: {device}"));
+    let Some((path, info)) = find_block_device(&objects, device) else {
+      send_notify("Mount Failed", &format!("No such device: {device_display}"));
       return Ok(());
     };
-    let interfaces = &objects[&path];
-    let mount_options = self.decode_mount_options(interfaces, mount_options);
 
-    if interfaces.contains_key(IFACE_FILESYSTEM) {
-      match self.mount_filesystem(&path, mount_options.as_deref()) {
+    let mount_options =
+      self.decode_mount_options(info.uuid.as_deref(), info.device.as_deref(), mount_options);
+
+    if info.filesystem.is_some() {
+      match self.try_mount_with_retry(&path, &mount_options) {
         Ok(mount_point) => {
           send_notify(
             "Drive Mounted",
-            &format!("Mounted {device} at {mount_point}"),
+            &format!("Mounted {device_display} at {mount_point}"),
           );
         }
         Err(e) => {
@@ -82,9 +138,9 @@ impl Manager {
       return Ok(());
     }
 
-    if interfaces.contains_key(IFACE_ENCRYPTED) {
-      send_notify("Encrypted Drive", &format!("Unlocking {device}..."));
-      let passphrase = prompt_password("Passphrase: ")?;
+    if info.is_encrypted {
+      send_notify("Encrypted Drive", &format!("Unlocking {device_display}..."));
+      let passphrase = password::prompt_password("Passphrase: ")?;
 
       let cleartext_path = match self.unlock_encrypted(&path, &passphrase) {
         Ok(p) => p,
@@ -94,11 +150,11 @@ impl Manager {
         }
       };
 
-      match self.try_mount_with_retry(&cleartext_path, mount_options.as_deref()) {
+      match self.try_mount_with_retry(&cleartext_path, &mount_options) {
         Ok(mount_point) => {
           send_notify(
             "Drive Unlocked & Mounted",
-            &format!("Mounted {device} at {mount_point}"),
+            &format!("Mounted {device_display} at {mount_point}"),
           );
         }
         Err(e) => {
@@ -111,7 +167,7 @@ impl Manager {
 
     send_notify(
       "Mount Failed",
-      &format!("{device} has neither a filesystem nor an encrypted payload"),
+      &format!("{device_display} has neither a filesystem nor an encrypted payload"),
     );
     Ok(())
   }
@@ -119,38 +175,63 @@ impl Manager {
   pub fn unmount_target(&self, target: &str) -> Result<(), Box<dyn std::error::Error>> {
     let manager = ObjectManagerProxy::builder(&self.conn).build()?;
     let objects = manager.get_managed_objects()?;
-    let target_is_dir = Path::new(target).is_dir();
+    let target_path = Path::new(target);
+    let target_is_dir = target_path.is_dir();
+    let target_dev = if target.starts_with("/dev/") {
+      PathBuf::from(target)
+    } else {
+      PathBuf::from(format!("/dev/{target}"))
+    };
 
-    let hit = objects.iter().find(|(path, interfaces)| {
-      let Some(fs_props) = interfaces.get(IFACE_FILESYSTEM) else {
-        return false;
-      };
-      if target_is_dir {
-        decode_bytes_array(fs_props, "MountPoints")
-          .iter()
-          .any(|mp| mp == target)
+    let hit = objects.iter().find_map(|(path, ifaces)| {
+      let info = DeviceInfo::from_interfaces(ifaces);
+      let matches = if target_is_dir {
+        info
+          .filesystem
+          .as_ref()
+          .is_some_and(|fs| fs.mount_points.iter().any(|mp| mp == target_path))
       } else {
-        find_block_object(&objects, target).as_ref() == Some(*path)
-      }
+        info.device.as_ref() == Some(&target_dev)
+          || info.preferred_device.as_ref() == Some(&target_dev)
+      };
+      matches.then_some((path.clone(), info))
     });
 
-    let Some((path, interfaces)) = hit else {
-      send_notify("Unmount Failed", &format!("{target} is not a known mount"));
+    let Some((path, info)) = hit else {
+      send_notify(
+        "Unmount Failed",
+        &format!("{target} is not a known mount or device"),
+      );
       return Ok(());
     };
-    let path = path.clone();
 
-    let fs = FilesystemProxyBlocking::builder(&self.conn)
-      .path(path.as_str())?
-      .build()?;
+    if info.filesystem.is_some() {
+      let fs = FilesystemProxyBlocking::builder(&self.conn)
+        .path(path.as_str())?
+        .build()?;
 
-    if let Err(e) = fs.unmount(HashMap::new()) {
-      send_notify("Unmount Failed", &e.to_string());
-      return Err(Box::new(e));
+      if let Err(e) = fs.unmount(HashMap::new()) {
+        send_notify("Unmount Failed", &e.to_string());
+        return Err(Box::new(e));
+      }
+      send_notify("Drive Unmounted", &format!("Unmounted {target}"));
     }
-    send_notify("Drive Unmounted", &format!("Unmounted {target}"));
 
-    if interfaces.contains_key(IFACE_ENCRYPTED) {
+    // Lock LUKS container:
+    // If the unmounted device is a cleartext child, its CryptoBackingDevice property points to the
+    // encrypted container
+    if let Some(ref backing_path) = info.crypto_backing_device {
+      let enc = EncryptedProxyBlocking::builder(&self.conn)
+        .path(backing_path.as_str())?
+        .build()?;
+      match enc.lock(HashMap::new()) {
+        Ok(()) => send_notify(
+          "Drive Locked",
+          &format!("Locked encrypted container for {target}"),
+        ),
+        Err(e) => send_notify("Lock Failed", &e.to_string()),
+      }
+    } else if info.is_encrypted {
       let enc = EncryptedProxyBlocking::builder(&self.conn)
         .path(path.as_str())?
         .build()?;
@@ -169,8 +250,9 @@ impl Manager {
     // devices already attached before we started listening won't generate an InterfacesAdded
     // signal, so sweep once at startup too
     let initial = manager.get_managed_objects()?;
-    for path in initial.keys() {
-      self.handle_new_object(path, &initial);
+    for (path, ifaces) in &initial {
+      let info = DeviceInfo::from_interfaces(ifaces);
+      self.handle_device_event(&path.as_ref(), &info);
     }
 
     let stream = manager.receive_interfaces_added()?;
@@ -178,14 +260,35 @@ impl Manager {
 
     for signal in stream {
       let Ok(args) = signal.args() else { continue };
-      let objects = manager.get_managed_objects()?;
-      self.handle_new_object(
-        &OwnedObjectPath::from(args.object_path().to_owned()),
-        &objects,
-      );
+      let info = DeviceInfo::from_interfaces(args.interfaces_and_properties());
+      self.handle_device_event(args.object_path(), &info);
     }
 
     Ok(())
+  }
+
+  fn handle_device_event(&self, path: &ObjectPath<'_>, dev: &DeviceInfo) {
+    if !dev.should_automount() {
+      return;
+    }
+
+    if dev.is_encrypted {
+      send_notify(
+        "Encrypted Drive Attached",
+        &format!("{path} needs to be unlocked manually!"),
+      );
+      return;
+    }
+
+    if dev.filesystem.is_some() {
+      let mount_options =
+        self.decode_mount_options(dev.uuid.as_deref(), dev.device.as_deref(), None);
+      let owned_path = OwnedObjectPath::from(path.to_owned());
+      match self.try_mount_with_retry(&owned_path, &mount_options) {
+        Ok(mp) => send_notify("Drive Mounted", &format!("Auto-mounted {path} at {mp}")),
+        Err(e) => send_notify("Automount Failed", &format!("{path}: {e}")),
+      }
+    }
   }
 
   fn unlock_encrypted(
@@ -202,24 +305,18 @@ impl Manager {
   fn mount_filesystem(
     &self,
     path: &OwnedObjectPath,
-    mount_options: Option<&str>,
+    mount_options: &HashMap<&str, Value<'_>>,
   ) -> zbus::Result<String> {
     let fs = FilesystemProxyBlocking::builder(&self.conn)
       .path(path.as_str())?
       .build()?;
-    let mut options = HashMap::new();
-    if let Some(o) = mount_options
-      && !o.is_empty()
-    {
-      options.insert("options", Value::from(o));
-    }
-    fs.mount(options)
+    fs.mount(mount_options.clone())
   }
 
   fn try_mount_with_retry(
     &self,
     path: &OwnedObjectPath,
-    mount_options: Option<&str>,
+    mount_options: &HashMap<&str, Value<'_>>,
   ) -> zbus::Result<String> {
     // UDisks2 needs a moment to finish probing a just-added filesystem before Mount succeeds,
     // so we retry briefly
@@ -235,53 +332,30 @@ impl Manager {
     }
   }
 
-  fn handle_new_object(&self, path: &OwnedObjectPath, objects: &ManagedObjects) {
-    let Some(interfaces) = objects.get(path) else {
-      return;
-    };
-    if !should_automount(interfaces) {
-      return;
-    }
-
-    if interfaces.contains_key(IFACE_FILESYSTEM) {
-      match self.try_mount_with_retry(path, None) {
-        Ok(mp) => send_notify("Drive Mounted", &format!("Auto-mounted {path} at {mp}")),
-        Err(e) => send_notify("Automount Failed", &format!("{path}: {e}")),
-      }
-    } else if interfaces.contains_key(IFACE_ENCRYPTED) {
-      // unattended background listener, no terminal to prompt on, can't safely guess a
-      // passphrase
-      send_notify(
-        "Encrypted Drive Attached",
-        &format!("{path} needs to be unlocked manually!"),
-      );
-    }
-  }
-
   fn decode_mount_options(
     &self,
-    interfaces: &HashMap<OwnedInterfaceName, HashMap<String, OwnedValue>>,
+    uuid: Option<&str>,
+    device: Option<&Path>,
     cli_options: Option<&str>,
-  ) -> Option<String> {
-    if let Some(opts) = cli_options {
-      return Some(opts.to_string());
-    }
-
-    let block_props = interfaces.get(IFACE_BLOCK)?;
-
-    if let Some(uuid) = decode_string(block_props, "IdUUID")
-      && let Some(opts) = self.config.get(&uuid)
-    {
-      return Some(opts.clone());
-    }
-
-    if let Some(dev) = decode_bytes(block_props, "Device")
-      && let Some(opts) = self.config.get(&dev)
-    {
-      return Some(opts.clone());
-    }
-
-    None
+  ) -> HashMap<&str, Value<'_>> {
+    cli_options
+      .map(String::from)
+      // get options from uuid
+      .or_else(|| uuid.and_then(|u| self.config.get(u).cloned()))
+      // or get them from the device path
+      .or_else(|| {
+        let d = device?;
+        let full_path = d.to_str().and_then(|s| self.config.get(s));
+        let file_name = d
+          .file_name()
+          .and_then(|n| n.to_str())
+          .and_then(|s| self.config.get(s));
+        full_path.or(file_name).cloned()
+      })
+      // convert to a hash map
+      .filter(|s| !s.is_empty())
+      .map(|s| HashMap::from([("options", Value::from(s))]))
+      .unwrap_or_default()
   }
 }
 
@@ -294,179 +368,22 @@ fn send_notify(title: &str, body: &str) {
   println!("[{title}] {body}");
 }
 
-fn decode_string(props: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
-  Some(
-    props
-      .get(key)
-      .and_then(|o| Value::try_from(o).ok())
-      .and_then(|v| Str::try_from(v).ok())?
-      .to_string(),
-  )
-}
-
-fn decode_bool(props: &HashMap<String, OwnedValue>, key: &str) -> bool {
-  props
-    .get(key)
-    .and_then(|v| bool::try_from(v).ok())
-    .unwrap_or(false)
-}
-
-/// `UDisks2` represents device/mount-point paths as null-terminated byte arrays (the 'ay' D-Bus
-/// type), not strings, so we decode one out of a property map. `Vec<T>` only converts from an owned
-/// `Value`, not `&OwnedValue` directly, so we go via the borrowed `Value<'_>` conversion first.
-fn decode_bytes(props: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
-  let owned = props.get(key)?;
-  let value: Value<'_> = Value::try_from(owned).ok()?;
-  let bytes: Vec<u8> = value.try_into().ok()?;
-  Some(
-    String::from_utf8_lossy(&bytes)
-      .trim_end_matches('\0')
-      .to_string(),
-  )
-}
-
-/// 'aay' - an array of the above, used for the Filesystem.MountPoints property (a device can be
-/// mounted at more than one place)
-fn decode_bytes_array(props: &HashMap<String, OwnedValue>, key: &str) -> Vec<String> {
-  let Some(owned) = props.get(key) else {
-    return Vec::new();
-  };
-  let Ok(value) = Value::try_from(owned) else {
-    return Vec::new();
-  };
-  let Ok(entries) = <Vec<Vec<u8>>>::try_from(value) else {
-    return Vec::new();
-  };
-  entries
-    .into_iter()
-    .map(|bytes| {
-      String::from_utf8_lossy(&bytes)
-        .trim_end_matches('\0')
-        .to_string()
-    })
-    .collect()
-}
-
-/// Resolve the supplied device argument to a `UDisks2` object path by asking `UDisks2` what every
-/// object's real device node is.
-fn find_block_object(objects: &ManagedObjects, device: &str) -> Option<OwnedObjectPath> {
-  let target = if device.starts_with("/dev/") {
-    device.to_string()
+fn find_block_device(
+  objects: &ManagedObjects,
+  device: &Path,
+) -> Option<(OwnedObjectPath, DeviceInfo)> {
+  let target_buf;
+  let target: &Path = if device.starts_with("/dev") {
+    device
   } else {
-    format!("/dev/{device}")
+    target_buf = Path::new("/dev").join(device);
+    &target_buf
   };
 
-  objects.iter().find_map(|(path, interfaces)| {
-    let block_props = interfaces.get(IFACE_BLOCK)?;
-    let device_matches = decode_bytes(block_props, "Device").as_deref() == Some(&target)
-      || decode_bytes(block_props, "PreferredDevice").as_deref() == Some(&target);
-    device_matches.then(|| path.clone())
+  objects.iter().find_map(|(path, ifaces)| {
+    let info = DeviceInfo::from_interfaces(ifaces);
+    let matches =
+      info.device.as_deref() == Some(target) || info.preferred_device.as_deref() == Some(target);
+    matches.then(|| (path.clone(), info))
   })
-}
-
-/// Should this newly-appeared object be auto-mounted? `UDisks2` exposes `HintAuto`/`HintIgnore` on
-/// the Block interface precisely so udev rules, fstab entries, or the admin can opt a device out of
-/// automounting
-fn should_automount(interfaces: &HashMap<OwnedInterfaceName, HashMap<String, OwnedValue>>) -> bool {
-  match interfaces.get(IFACE_BLOCK) {
-    Some(block_props) => {
-      !decode_bool(block_props, "HintIgnore") && decode_bool(block_props, "HintAuto")
-    }
-    None => false,
-  }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Termios {
-  c_iflag: u32,
-  c_oflag: u32,
-  c_cflag: u32,
-  c_lflag: u32,
-  c_line: u8,
-  c_cc: [u8; 32],
-  c_ispeed: u32,
-  c_ospeed: u32,
-}
-
-const ECHO: u32 = 0x0008;
-const TCSAFLUSH: std::ffi::c_int = 2;
-
-unsafe extern "C" {
-  fn tcgetattr(fd: std::ffi::c_int, termios_p: *mut Termios) -> std::ffi::c_int;
-  fn tcsetattr(
-    fd: std::ffi::c_int,
-    optional_actions: std::ffi::c_int,
-    termios_p: *const Termios,
-  ) -> std::ffi::c_int;
-}
-
-struct EchoGuard {
-  fd: std::ffi::c_int,
-  orig: Termios,
-  active: bool,
-}
-impl EchoGuard {
-  fn disable(fd: std::ffi::c_int) -> io::Result<Self> {
-    let mut orig = Termios::default();
-    if unsafe { tcgetattr(fd, &mut orig) } != 0 {
-      return Err(io::Error::last_os_error());
-    }
-
-    let mut raw = orig;
-    raw.c_lflag &= !ECHO;
-
-    if unsafe { tcsetattr(fd, TCSAFLUSH, &raw) } != 0 {
-      return Err(io::Error::last_os_error());
-    }
-
-    Ok(Self {
-      fd,
-      orig,
-      active: true,
-    })
-  }
-}
-impl Drop for EchoGuard {
-  fn drop(&mut self) {
-    if self.active {
-      unsafe {
-        tcsetattr(self.fd, TCSAFLUSH, &self.orig);
-      }
-    }
-  }
-}
-
-fn prompt_password(prompt: &str) -> io::Result<String> {
-  let stdin = io::stdin();
-  let is_tty = stdin.is_terminal();
-
-  print!("{prompt}");
-  io::stdout().flush()?;
-
-  let guard = if is_tty {
-    Some(EchoGuard::disable(stdin.as_raw_fd())?)
-  } else {
-    None
-  };
-
-  let mut password = String::new();
-  let res = std::io::stdin().lock().read_line(&mut password);
-
-  drop(guard);
-
-  if is_tty {
-    println!();
-  }
-
-  res?;
-
-  if password.ends_with('\n') {
-    password.pop();
-    if password.ends_with('\r') {
-      password.pop();
-    }
-  }
-
-  Ok(password)
 }

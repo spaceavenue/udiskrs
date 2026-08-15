@@ -1,4 +1,6 @@
 mod config;
+mod password;
+mod property;
 mod udisks;
 
 use std::path::PathBuf;
@@ -25,7 +27,7 @@ pub enum Commands {
   /// Mount a block device. Also unlocks LUKS containers
   Mount {
     /// Device name or path (e.g. /dev/sda1 or sda1)
-    device: String,
+    device: PathBuf,
 
     #[arg(short, long)]
     options: Option<String>,

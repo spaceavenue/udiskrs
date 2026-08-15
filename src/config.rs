@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
-/// Resolves config path. Order of precedence is CLI -> `XDG_CONFIG_HOME` -> `$HOME/.config` -> `/etc`
+/// Resolves config path. Order of precedence is CLI -> `XDG_CONFIG_HOME` -> `$HOME/.config` ->
+/// `/etc`
 fn resolve_path(path: Option<&Path>) -> Option<PathBuf> {
   if let Some(p) = path.filter(|p| p.exists()) {
     return Some(p.to_path_buf());
@@ -42,10 +43,8 @@ pub fn load_config(path: Option<&Path>) -> HashMap<String, String> {
       continue;
     }
 
-    let parts = line.split_whitespace().collect::<Vec<&str>>();
-
-    if parts.len() == 2 {
-      map.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
+    if let Some((key, val)) = line.split_once(char::is_whitespace) {
+      map.insert(key.trim().to_string(), val.trim().to_string());
     }
   }
   map
