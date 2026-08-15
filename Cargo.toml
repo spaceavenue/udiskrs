@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.104"
 async-io = "2.6.0"
 clap = { version = "4.6.6", default-features = false, features = ["derive", "std"]}
 futures-lite = "2.6.1"

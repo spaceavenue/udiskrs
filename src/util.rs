@@ -8,13 +8,20 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 use crate::udisks::DeviceInfo;
 
-pub fn send_notify(title: &str, body: &str) {
+pub fn send_notify(title: &str, body: impl AsRef<str>) {
+  let body = body.as_ref();
   let _ = Notification::new()
     .summary(title)
     .body(body)
     .appname("udiskrs")
     .show();
   println!("[{title}] {body}");
+}
+
+pub fn bail_notify<T>(title: &str, body: impl AsRef<str>) -> anyhow::Result<T> {
+  let body = body.as_ref();
+  send_notify(title, body);
+  anyhow::bail!("{body}")
 }
 
 pub fn find_block_device(

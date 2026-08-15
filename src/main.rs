@@ -6,6 +6,7 @@ mod util;
 
 use std::path::PathBuf;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use zbus::Connection;
 
@@ -48,11 +49,13 @@ pub enum Commands {
   },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> anyhow::Result<()> {
   let args = Cli::parse();
 
   async_io::block_on(async {
-    let conn = Connection::system().await?;
+    let conn = Connection::system()
+      .await
+      .context("Failed to establish system D-Bus connection")?;
     let manager = Manager::new(conn, args.config.as_deref());
 
     match args.command {

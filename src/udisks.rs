@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
 use futures_lite::StreamExt;
 use zbus::fdo::ObjectManagerProxy;
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
+use zbus::names::OwnedInterfaceName;
+use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, proxy};
 
 use crate::property::{InterfaceMap, PropertyMap};
@@ -89,6 +91,7 @@ impl DeviceInfo {
 
     info
   }
+
   fn is_mounted(&self) -> bool {
     self
       .filesystem
@@ -111,26 +114,33 @@ impl Manager {
     Self { conn, config }
   }
 
-  async fn object_manager(&self) -> zbus::Result<ObjectManagerProxy<'_>> {
+  async fn object_manager(&self) -> Result<ObjectManagerProxy<'_>> {
     ObjectManagerProxy::builder(&self.conn)
-      .destination(UDISKS2_SERVICE)?
-      .path(UDISKS2_PATH)?
+      .destination(UDISKS2_SERVICE)
+      .context("Invalid UDisks2 destination")?
+      .path(UDISKS2_PATH)
+      .context("Invalid UDisks2 path")?
       .build()
       .await
+      .context("Failed to connect to UDisks2 ObjectManager")
   }
-
-  pub async fn mount_device(
+  async fn get_objects(
     &self,
-    device: &Path,
-    mount_options: Option<&str>,
-  ) -> Result<(), Box<dyn std::error::Error>> {
+    manager: &ObjectManagerProxy<'_>,
+  ) -> Result<HashMap<OwnedObjectPath, HashMap<OwnedInterfaceName, HashMap<String, OwnedValue>>>>
+  {
+    manager
+      .get_managed_objects()
+      .await
+      .context("Failed to retrieve managed objects from UDisks2")
+  }
+  pub async fn mount_device(&self, device: &Path, mount_options: Option<&str>) -> Result<()> {
     let device_display = device.display();
     let manager = self.object_manager().await?;
-    let objects = manager.get_managed_objects().await?;
+    let objects = self.get_objects(&manager).await?;
 
     let Some((path, info)) = util::find_block_device(&objects, device) else {
-      util::send_notify("Mount Failed", &format!("No such device: {device_display}"));
-      return Ok(());
+      return util::bail_notify("Mount Failed", format!("No such device: {device_display}"));
     };
 
     let mount_options =
@@ -141,26 +151,31 @@ impl Manager {
         Ok(mount_point) => {
           util::send_notify(
             "Drive Mounted",
-            &format!("Mounted {device_display} at {mount_point}"),
+            format!("Mounted {device_display} at {mount_point}"),
           );
+          return Ok(());
         }
         Err(e) => {
-          util::send_notify("Mount Failed", &e.to_string());
-          return Err(Box::new(e));
+          return util::bail_notify(
+            "Mount Failed",
+            format!("Failed to mount {device_display}: {e}"),
+          );
         }
       }
-      return Ok(());
     }
 
     if info.is_encrypted {
-      util::send_notify("Encrypted Drive", &format!("Unlocking {device_display}..."));
-      let passphrase = password::prompt_password("Passphrase: ")?;
+      util::send_notify("Encrypted Drive", format!("Unlocking {device_display}..."));
+      let passphrase = password::prompt_password("Passphrase: ")
+        .context("Failed to read passphrase from terminal")?;
 
       let cleartext_path = match self.unlock_encrypted(&path, &passphrase).await {
         Ok(p) => p,
         Err(e) => {
-          util::send_notify("Unlock Failed", &e.to_string());
-          return Err(Box::new(e));
+          return util::bail_notify(
+            "Unlock Failed",
+            format!("Failed to unlock {device_display}: {e}"),
+          );
         }
       };
 
@@ -171,27 +186,29 @@ impl Manager {
         Ok(mount_point) => {
           util::send_notify(
             "Drive Unlocked & Mounted",
-            &format!("Mounted {device_display} at {mount_point}"),
+            format!("Mounted {device_display} at {mount_point}"),
           );
+          return Ok(());
         }
         Err(e) => {
-          util::send_notify("Mount Failed", &e.to_string());
-          return Err(Box::new(e));
+          return util::bail_notify(
+            "Mount Failed",
+            format!("Failed to mount unlocked device {device_display}: {e}"),
+          );
         }
       }
-      return Ok(());
     }
 
-    util::send_notify(
+    util::bail_notify(
       "Mount Failed",
-      &format!("{device_display} has neither a filesystem nor an encrypted payload"),
-    );
-    Ok(())
+      format!("{device_display} has neither a filesystem nor an encrypted payload"),
+    )
   }
 
-  pub async fn unmount_target(&self, target: &str) -> Result<(), Box<dyn std::error::Error>> {
+  pub async fn unmount_target(&self, target: &str) -> Result<()> {
     let manager = self.object_manager().await?;
-    let objects = manager.get_managed_objects().await?;
+    let objects = self.get_objects(&manager).await?;
+
     let target_path = Path::new(target);
     let target_is_dir = target_path.is_dir();
     let target_dev = if target.starts_with("/dev/") {
@@ -215,24 +232,24 @@ impl Manager {
     });
 
     let Some((path, info)) = hit else {
-      util::send_notify(
+      return util::bail_notify(
         "Unmount Failed",
-        &format!("{target} is not a known mount or device"),
+        format!("{target} is not a known mount or device"),
       );
-      return Ok(());
     };
 
     if info.filesystem.is_some() {
       let fs = FilesystemProxy::builder(&self.conn)
-        .path(path.as_str())?
+        .path(path.as_str())
+        .context("Invalid filesystem object path")?
         .build()
-        .await?;
+        .await
+        .context("Failed to create Filesystem proxy")?;
 
       if let Err(e) = fs.unmount(HashMap::new()).await {
-        util::send_notify("Unmount Failed", &e.to_string());
-        return Err(Box::new(e));
+        return util::bail_notify("Unmount Failed", format!("Failed to unmount {target}: {e}"));
       }
-      util::send_notify("Drive Unmounted", &format!("Unmounted {target}"));
+      util::send_notify("Drive Unmounted", format!("Unmounted {target}"));
     }
 
     // Lock LUKS container:
@@ -240,42 +257,60 @@ impl Manager {
     // encrypted container
     if let Some(ref backing_path) = info.crypto_backing_device {
       let enc = EncryptedProxy::builder(&self.conn)
-        .path(backing_path.as_str())?
+        .path(backing_path.as_str())
+        .context("Invalid encrypted container object path")?
         .build()
-        .await?;
+        .await
+        .context("Failed to create Encrypted proxy for container")?;
       match enc.lock(HashMap::new()).await {
         Ok(()) => util::send_notify(
           "Drive Locked",
-          &format!("Locked encrypted container for {target}"),
+          format!("Locked encrypted container for {target}"),
         ),
-        Err(e) => util::send_notify("Lock Failed", &e.to_string()),
+        Err(e) => {
+          return util::bail_notify(
+            "Lock Failed",
+            format!("Failed to lock encrypted container for {target}: {e}"),
+          );
+        }
       }
     } else if info.is_encrypted {
       let enc = EncryptedProxy::builder(&self.conn)
-        .path(path.as_str())?
+        .path(path.as_str())
+        .context("Invalid encrypted object path")?
         .build()
-        .await?;
+        .await
+        .context("Failed to create Encrypted proxy")?;
       match enc.lock(HashMap::new()).await {
-        Ok(()) => util::send_notify("Drive Locked", &format!("Locked container {target}")),
-        Err(e) => util::send_notify("Lock Failed", &e.to_string()),
+        Ok(()) => util::send_notify("Drive Locked", format!("Locked container {target}")),
+        Err(e) => {
+          return util::bail_notify(
+            "Lock Failed",
+            format!("Failed to lock container {target}: {e}"),
+          );
+        }
       }
     }
 
     Ok(())
   }
 
-  pub async fn run_automount(&self) -> Result<(), Box<dyn std::error::Error>> {
+  pub async fn run_automount(&self) -> Result<()> {
     let manager = self.object_manager().await?;
 
     // devices already attached before we started listening won't generate an InterfacesAdded
     // signal, so sweep once at startup too
-    let initial = manager.get_managed_objects().await?;
+    let initial = self.get_objects(&manager).await?;
+
     for (path, ifaces) in &initial {
       let info = DeviceInfo::from_interfaces(ifaces);
       self.handle_device_event(&path.as_ref(), &info).await;
     }
 
-    let mut stream = manager.receive_interfaces_added().await?;
+    let mut stream = manager
+      .receive_interfaces_added()
+      .await
+      .context("Failed to subscribe to InterfacesAdded D-Bus signals")?;
     util::send_notify("Automount Active", "Listening for UDisks2 events...");
 
     while let Some(signal) = stream.next().await {
@@ -287,9 +322,10 @@ impl Manager {
     Ok(())
   }
 
-  pub async fn info(&self, target: &str, all: bool) -> Result<(), Box<dyn std::error::Error>> {
+  pub async fn info(&self, target: &str, all: bool) -> Result<()> {
     let manager = self.object_manager().await?;
-    let objects = manager.get_managed_objects().await?;
+    let objects = self.get_objects(&manager).await?;
+
     let target_path = Path::new(target);
     let target_is_dir = target_path.is_dir();
     let target_dev = if target.starts_with("/dev/") {
@@ -312,11 +348,10 @@ impl Manager {
     });
 
     let Some((path, ifaces)) = hit else {
-      util::send_notify(
+      return util::bail_notify(
         "Failed to get info",
-        &format!("{target} is not a known mount or device"),
+        format!("{target} is not a known mount or device"),
       );
-      return Ok(());
     };
     let info = DeviceInfo::from_interfaces(ifaces);
     let mount_options =
@@ -337,7 +372,7 @@ impl Manager {
     if dev.is_encrypted {
       util::send_notify(
         "Encrypted Drive Attached",
-        &format!("{path} needs to be unlocked manually!"),
+        format!("{path} needs to be unlocked manually!"),
       );
       return;
     }
@@ -347,8 +382,8 @@ impl Manager {
         self.decode_mount_options(dev.uuid.as_deref(), dev.device.as_deref(), None);
       let owned_path = OwnedObjectPath::from(path.to_owned());
       match self.try_mount_with_retry(&owned_path, &mount_options).await {
-        Ok(mp) => util::send_notify("Drive Mounted", &format!("Auto-mounted {path} at {mp}")),
-        Err(e) => util::send_notify("Automount Failed", &format!("{path}: {e}")),
+        Ok(mp) => util::send_notify("Drive Mounted", format!("Auto-mounted {path} at {mp}")),
+        Err(e) => util::send_notify("Automount Failed", format!("{path}: {e:#}")),
       }
     }
   }
@@ -357,39 +392,46 @@ impl Manager {
     &self,
     path: &OwnedObjectPath,
     passphrase: &str,
-  ) -> zbus::Result<OwnedObjectPath> {
+  ) -> Result<OwnedObjectPath> {
     let enc = EncryptedProxy::builder(&self.conn)
-      .path(path.as_str())?
+      .path(path.as_str())
+      .context("Invalid encrypted object path")?
       .build()
-      .await?;
-    enc.unlock(passphrase, HashMap::new()).await
+      .await
+      .context("Failed to build Encrypted proxy")?;
+    enc
+      .unlock(passphrase, HashMap::new())
+      .await
+      .context("Passphrase rejected or unlock operation failed")
   }
 
   async fn mount_filesystem(
     &self,
     path: &OwnedObjectPath,
     mount_options: &HashMap<&str, Value<'_>>,
-  ) -> zbus::Result<String> {
+  ) -> Result<String> {
     let fs = FilesystemProxy::builder(&self.conn)
-      .path(path.as_str())?
+      .path(path.as_str())
+      .context("Invalid filesystem object path")?
       .build()
-      .await?;
-    fs.mount(mount_options.clone()).await
+      .await
+      .context("Failed to build Filesystem proxy")?;
+    fs.mount(mount_options.clone())
+      .await
+      .context("UDisks2 mount method failed")
   }
 
   async fn try_mount_with_retry(
     &self,
     path: &OwnedObjectPath,
     mount_options: &HashMap<&str, Value<'_>>,
-  ) -> zbus::Result<String> {
-    // UDisks2 needs a moment to finish probing a just-added filesystem before Mount succeeds,
-    // so we retry briefly
+  ) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
       match self.mount_filesystem(path, mount_options).await {
         Ok(mp) => return Ok(mp),
         Err(_) if Instant::now() < deadline => {
-          std::thread::sleep(Duration::from_millis(200));
+          async_io::Timer::after(Duration::from_millis(200)).await;
         }
         Err(e) => return Err(e),
       }
