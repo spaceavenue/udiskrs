@@ -8,22 +8,51 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 use crate::udisks::DeviceInfo;
 
-pub fn send_notify(title: &str, body: impl AsRef<str>) {
+fn notify(title: &str, body: impl AsRef<str>) {
   let body = body.as_ref();
   let _ = Notification::new()
     .summary(title)
     .body(body)
     .appname("udiskrs")
     .show();
+}
+
+/// Send a notification and log to stdout.
+pub fn log_notify(title: impl AsRef<str>, body: impl AsRef<str>) {
+  let title = title.as_ref();
+  let body = body.as_ref();
+  notify(title, body);
   println!("[{title}] {body}");
 }
 
-pub fn bail_notify<T>(title: &str, body: impl AsRef<str>) -> anyhow::Result<T> {
+/// Send a notification and log to stderr.
+pub fn log_notify_err(title: &str, body: impl AsRef<str>, e: impl Into<anyhow::Error>) {
   let body = body.as_ref();
-  send_notify(title, body);
-  anyhow::bail!("{body}")
+  let e = e.into();
+  notify(title, format!("{body}: {e}"));
+  eprintln!("[ERROR]:\n{title}: {body}\n{e:#}");
 }
 
+/// Send a notification and return an error.
+pub fn bail_notify<T>(title: &str, body: impl AsRef<str>) -> anyhow::Result<T> {
+  let body = body.as_ref();
+  notify(title, body);
+  anyhow::bail!("[ERROR]:\n{title}: {body}")
+}
+
+/// Send a notification and return an error, with additional error context.
+pub fn bail_notify_err<T>(
+  title: &str,
+  body: impl AsRef<str>,
+  e: impl Into<anyhow::Error>,
+) -> anyhow::Result<T> {
+  let body = body.as_ref();
+  let e = e.into();
+  notify(title, format!("{body}: {e}"));
+  anyhow::bail!("[ERROR]:\n{title}: {body}\n{e:#}")
+}
+
+/// Resolve a device path to a block device managed by UDisks2. Returns None if not found.
 pub fn find_block_device(
   objects: &ManagedObjects,
   device: &Path,
@@ -44,6 +73,7 @@ pub fn find_block_device(
   })
 }
 
+/// Print summary about a device.
 pub fn print_device_info(info: &DeviceInfo, mount_options: &HashMap<&str, Value<'_>>) {
   let device = info
     .device
@@ -98,6 +128,7 @@ Config Mount Opts:  {config_opts}"
   println!("{output}");
 }
 
+/// Print all UDisks2 properties for all Interfaces.
 pub fn print_udisks_properties(
   path: &ObjectPath<'_>,
   ifaces: &HashMap<OwnedInterfaceName, HashMap<String, OwnedValue>>,

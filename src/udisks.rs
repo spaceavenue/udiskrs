@@ -151,32 +151,34 @@ impl Manager {
     if info.filesystem.is_some() {
       match self.try_mount_with_retry(&path, &mount_options).await {
         Ok(mount_point) => {
-          util::send_notify(
+          util::log_notify(
             "Drive Mounted",
             format!("Mounted {device_display} at {mount_point}"),
           );
           return Ok(());
         }
         Err(e) => {
-          return util::bail_notify(
+          return util::bail_notify_err(
             "Mount Failed",
-            format!("Failed to mount {device_display}: {e}"),
+            format!("Failed to mount {device_display}"),
+            e,
           );
         }
       }
     }
 
     if info.is_encrypted {
-      util::send_notify("Encrypted Drive", format!("Unlocking {device_display}..."));
+      util::log_notify("Encrypted Drive", format!("Unlocking {device_display}..."));
       let passphrase = password::prompt_password("Passphrase: ")
         .context("Failed to read passphrase from terminal")?;
 
       let cleartext_path = match self.unlock_encrypted(&path, &passphrase).await {
         Ok(p) => p,
         Err(e) => {
-          return util::bail_notify(
+          return util::bail_notify_err(
             "Unlock Failed",
-            format!("Failed to unlock {device_display}: {e}"),
+            format!("Failed to unlock {device_display}"),
+            e,
           );
         }
       };
@@ -186,16 +188,17 @@ impl Manager {
         .await
       {
         Ok(mount_point) => {
-          util::send_notify(
+          util::log_notify(
             "Drive Unlocked & Mounted",
             format!("Mounted {device_display} at {mount_point}"),
           );
           return Ok(());
         }
         Err(e) => {
-          return util::bail_notify(
+          return util::bail_notify_err(
             "Mount Failed",
-            format!("Failed to mount unlocked device {device_display}: {e}"),
+            format!("Failed to mount unlocked device {device_display}"),
+            e,
           );
         }
       }
@@ -249,9 +252,9 @@ impl Manager {
         .context("Failed to create Filesystem proxy")?;
 
       if let Err(e) = fs.unmount(HashMap::new()).await {
-        return util::bail_notify("Unmount Failed", format!("Failed to unmount {target}: {e}"));
+        return util::bail_notify_err("Unmount Failed", format!("Failed to unmount {target}"), e);
       }
-      util::send_notify("Drive Unmounted", format!("Unmounted {target}"));
+      util::log_notify("Drive Unmounted", format!("Unmounted {target}"));
     }
 
     // Lock LUKS container:
@@ -265,14 +268,15 @@ impl Manager {
         .await
         .context("Failed to create Encrypted proxy for container")?;
       match enc.lock(HashMap::new()).await {
-        Ok(()) => util::send_notify(
+        Ok(()) => util::log_notify(
           "Drive Locked",
           format!("Locked encrypted container for {target}"),
         ),
         Err(e) => {
-          return util::bail_notify(
+          return util::bail_notify_err(
             "Lock Failed",
-            format!("Failed to lock encrypted container for {target}: {e}"),
+            format!("Failed to lock encrypted container for {target}"),
+            e,
           );
         }
       }
@@ -284,11 +288,12 @@ impl Manager {
         .await
         .context("Failed to create Encrypted proxy")?;
       match enc.lock(HashMap::new()).await {
-        Ok(()) => util::send_notify("Drive Locked", format!("Locked container {target}")),
+        Ok(()) => util::log_notify("Drive Locked", format!("Locked container {target}")),
         Err(e) => {
-          return util::bail_notify(
+          return util::bail_notify_err(
             "Lock Failed",
-            format!("Failed to lock container {target}: {e}"),
+            format!("Failed to lock container {target}"),
+            e,
           );
         }
       }
@@ -309,9 +314,9 @@ impl Manager {
       let manager = self.clone();
       let path_owned = path.clone();
       ex.spawn(async move {
-        manager
-          .handle_device_event(&path_owned.as_ref(), &info)
-          .await;
+        if let Err(e) = manager.handle_device_event(&path_owned, &info).await {
+          util::log_notify_err("Automount Failed", format!("{path_owned}"), e);
+        };
       })
       .detach();
     }
@@ -320,7 +325,7 @@ impl Manager {
       .receive_interfaces_added()
       .await
       .context("Failed to subscribe to InterfacesAdded D-Bus signals")?;
-    util::send_notify("Automount Active", "Listening for UDisks2 events...");
+    util::log_notify("Automount Active", "Listening for UDisks2 events...");
 
     while let Some(signal) = stream.next().await {
       let Ok(args) = signal.args() else { continue };
@@ -328,7 +333,9 @@ impl Manager {
       let manager = self.clone();
       let path_owned = args.object_path().to_owned();
       ex.spawn(async move {
-        manager.handle_device_event(&path_owned, &info).await;
+        if let Err(e) = manager.handle_device_event(&path_owned, &info).await {
+          util::log_notify_err("Automount Failed", format!("{path_owned}"), e);
+        };
       })
       .detach();
     }
@@ -378,28 +385,29 @@ impl Manager {
     Ok(())
   }
 
-  async fn handle_device_event(&self, path: &ObjectPath<'_>, dev: &DeviceInfo) {
+  async fn handle_device_event(&self, path: &ObjectPath<'_>, dev: &DeviceInfo) -> Result<()> {
     if !dev.should_automount() {
-      return;
+      return Ok(());
     }
 
     if dev.is_encrypted {
-      util::send_notify(
+      return Ok(util::log_notify(
         "Encrypted Drive Attached",
         format!("{path} needs to be unlocked manually!"),
-      );
-      return;
+      ));
     }
 
     if dev.filesystem.is_some() {
       let mount_options =
         self.decode_mount_options(dev.uuid.as_deref(), dev.device.as_deref(), None);
       let owned_path = OwnedObjectPath::from(path.to_owned());
-      match self.try_mount_with_retry(&owned_path, &mount_options).await {
-        Ok(mp) => util::send_notify("Drive Mounted", format!("Auto-mounted {path} at {mp}")),
-        Err(e) => util::send_notify("Automount Failed", format!("{path}: {e:#}")),
-      }
+      let mp = self
+        .try_mount_with_retry(&owned_path, &mount_options)
+        .await
+        .with_context(|| "Failed to mount {path}")?;
+      util::log_notify("Drive Mounted", format!("Auto-mounted {path} at {mp}"));
     }
+    Ok(())
   }
 
   async fn unlock_encrypted(
