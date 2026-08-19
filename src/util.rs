@@ -1,20 +1,41 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use notify_rust::Notification;
 use zbus::fdo::ManagedObjects;
 use zbus::names::OwnedInterfaceName;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 use crate::udisks::DeviceInfo;
 
-fn notify(title: &str, body: impl AsRef<str>) {
-  let body = body.as_ref();
-  let _ = Notification::new()
-    .summary(title)
-    .body(body)
-    .appname("udiskrs")
-    .show();
+pub async fn notify_async(title: &str, body: &str) {
+  if let Ok(conn) = zbus::Connection::session().await {
+    let empty_hints = HashMap::<&str, Value<'_>>::new();
+    let _ = conn
+      .call_method(
+        Some("org.freedesktop.Notifications"),
+        "/org/freedesktop/Notifications",
+        Some("org.freedesktop.Notifications"),
+        "Notify",
+        &(
+          "udiskrs",
+          0u32,
+          "",
+          title,
+          body,
+          &[] as &[&str],
+          &empty_hints,
+          -1i32,
+        ),
+      )
+      .await;
+  }
+}
+
+fn notify(title: &str, body: &str) {
+  // fire and forget
+  let title = title.to_string();
+  let body = body.to_string();
+  let () = async_io::block_on(notify_async(&title, &body));
 }
 
 /// Send a notification and log to stdout.
@@ -29,7 +50,7 @@ pub fn log_notify(title: impl AsRef<str>, body: impl AsRef<str>) {
 pub fn log_notify_err(title: &str, body: impl AsRef<str>, e: impl Into<anyhow::Error>) {
   let body = body.as_ref();
   let e = e.into();
-  notify(title, format!("{body}: {e}"));
+  notify(title, &format!("{body}: {e}"));
   eprintln!("[ERROR]:\n{title}: {body}\n{e:#}");
 }
 
@@ -48,11 +69,11 @@ pub fn bail_notify_err<T>(
 ) -> anyhow::Result<T> {
   let body = body.as_ref();
   let e = e.into();
-  notify(title, format!("{body}: {e}"));
+  notify(title, &format!("{body}: {e}"));
   anyhow::bail!("[ERROR]:\n{title}: {body}\n{e:#}")
 }
 
-/// Resolve a device path to a block device managed by UDisks2. Returns None if not found.
+/// Resolve a device path to a block device managed by `UDisks2`. Returns None if not found.
 pub fn find_block_device(
   objects: &ManagedObjects,
   device: &Path,
@@ -128,7 +149,7 @@ Config Mount Opts:  {config_opts}"
   println!("{output}");
 }
 
-/// Print all UDisks2 properties for all Interfaces.
+/// Print all `UDisks2` properties for all Interfaces.
 pub fn print_udisks_properties(
   path: &ObjectPath<'_>,
   ifaces: &HashMap<OwnedInterfaceName, HashMap<String, OwnedValue>>,

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use async_executor;
 use futures_lite::StreamExt;
 use zbus::fdo::ObjectManagerProxy;
 use zbus::names::OwnedInterfaceName;
@@ -108,11 +108,11 @@ impl DeviceInfo {
 #[derive(Clone)]
 pub struct Manager {
   conn: Connection,
-  config: HashMap<String, String>,
+  config: Arc<HashMap<String, String>>,
 }
 impl Manager {
   pub fn new(conn: Connection, config_path: Option<&Path>) -> Self {
-    let config = config::load_config(config_path);
+    let config = Arc::new(config::load_config(config_path));
     Self { conn, config }
   }
 
@@ -311,14 +311,16 @@ impl Manager {
 
     for (path, ifaces) in &initial {
       let info = DeviceInfo::from_interfaces(ifaces);
-      let manager = self.clone();
-      let path_owned = path.clone();
-      ex.spawn(async move {
-        if let Err(e) = manager.handle_device_event(&path_owned, &info).await {
-          util::log_notify_err("Automount Failed", format!("{path_owned}"), e);
-        };
-      })
-      .detach();
+      if info.should_automount() {
+        let manager = self.clone();
+        let path_owned = path.clone();
+        ex.spawn(async move {
+          if let Err(e) = manager.handle_device_event(&path_owned, &info).await {
+            util::log_notify_err("Automount Failed", format!("{path_owned}"), e);
+          }
+        })
+        .detach();
+      }
     }
 
     let mut stream = manager
@@ -330,14 +332,16 @@ impl Manager {
     while let Some(signal) = stream.next().await {
       let Ok(args) = signal.args() else { continue };
       let info = DeviceInfo::from_interfaces(args.interfaces_and_properties());
-      let manager = self.clone();
-      let path_owned = args.object_path().to_owned();
-      ex.spawn(async move {
-        if let Err(e) = manager.handle_device_event(&path_owned, &info).await {
-          util::log_notify_err("Automount Failed", format!("{path_owned}"), e);
-        };
-      })
-      .detach();
+      if info.should_automount() {
+        let manager = self.clone();
+        let path_owned = args.object_path().to_owned();
+        ex.spawn(async move {
+          if let Err(e) = manager.handle_device_event(&path_owned, &info).await {
+            util::log_notify_err("Automount Failed", format!("{path_owned}"), e);
+          }
+        })
+        .detach();
+      }
     }
 
     Ok(())
@@ -391,10 +395,13 @@ impl Manager {
     }
 
     if dev.is_encrypted {
-      return Ok(util::log_notify(
-        "Encrypted Drive Attached",
-        format!("{path} needs to be unlocked manually!"),
-      ));
+      return {
+        let _: () = util::log_notify(
+          "Encrypted Drive Attached",
+          format!("{path} needs to be unlocked manually!"),
+        );
+        Ok(())
+      };
     }
 
     if dev.filesystem.is_some() {

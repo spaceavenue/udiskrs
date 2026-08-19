@@ -40,7 +40,7 @@ pub trait PropertyMap {
   fn get_path(&self, key: &str) -> Option<PathBuf> {
     let val = self.get_value(key)?;
     let bytes: Result<Vec<u8>, _> = val.clone().try_into();
-    bytes.ok().map(|b| parse_byte_path(&b))
+    bytes.ok().map(|b| parse_byte_slice(&b))
   }
 
   fn get_paths(&self, key: &str) -> Vec<PathBuf> {
@@ -49,14 +49,17 @@ pub trait PropertyMap {
     };
     let entries: Result<Vec<Vec<u8>>, _> = val.clone().try_into();
     entries
-      .map(|list| list.into_iter().map(|b| parse_byte_path(&b)).collect())
+      .map(|list| list.into_iter().map(|b| parse_byte_slice(&b)).collect())
       .unwrap_or_default()
   }
 
   fn get_object_path(&self, key: &str) -> Option<OwnedObjectPath> {
-    self
-      .get_value(key)
-      .and_then(|v| OwnedObjectPath::try_from(v.clone()).ok())
+    let val = self.get_value(key)?;
+    if let Value::ObjectPath(p) = val {
+      Some(OwnedObjectPath::from(p.to_owned()))
+    } else {
+      OwnedObjectPath::try_from(val.clone()).ok()
+    }
   }
 }
 
@@ -104,7 +107,8 @@ impl<'a> InterfaceMap for HashMap<InterfaceName<'a>, HashMap<&'a str, Value<'a>>
   }
 }
 
-fn parse_byte_path(bytes: &[u8]) -> PathBuf {
-  let string = String::from_utf8_lossy(bytes);
-  PathBuf::from(string.trim_end_matches('\0'))
+fn parse_byte_slice(bytes: &[u8]) -> PathBuf {
+  use std::os::unix::ffi::OsStrExt;
+  let raw = bytes.strip_suffix(b"\0").unwrap_or(bytes);
+  PathBuf::from(std::ffi::OsStr::from_bytes(raw))
 }

@@ -8,12 +8,12 @@ anyhow = "1.0.104"
 async-executor = "1.14.0"
 async-io = "2.6.0"
 clap = { version = "4.6.6", default-features = false, features = ["derive", "std"]}
+dlmalloc = { version = "0.2.14", features = ["global"] }
 futures-lite = "2.6.1"
-notify-rust = { version = "4.18.0", default-features = false, features = ["zbus", "serde"] }
-zbus = "5.18.0"
+zbus = { version = "5.18.0", default-features = false, features = ["async-io"] }
 
 [profile.release]
-opt-level = 3
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = true

@@ -6,6 +6,9 @@ mod util;
 
 use std::path::PathBuf;
 
+#[global_allocator]
+static GLOBAL: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
+
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use zbus::Connection;
