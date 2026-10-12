@@ -411,7 +411,7 @@ impl Manager {
       let mp = self
         .try_mount_with_retry(&owned_path, &mount_options)
         .await
-        .with_context(|| "Failed to mount {path}")?;
+        .with_context(|| format!("Failed to mount {path}"))?;
       util::log_notify("Drive Mounted", format!("Auto-mounted {path} at {mp}"));
     }
     Ok(())
